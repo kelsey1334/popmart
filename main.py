@@ -2,6 +2,7 @@
 import os
 import io
 import json
+import base64
 import asyncio
 import logging
 import threading
@@ -22,7 +23,7 @@ log = logging.getLogger("popmart-bot")
 
 # ===== Config =====
 # BASE_URL có thể là root (vd https://your-app) hoặc đã kèm /popmart (vd https://your-app/popmart)
-BASE_URL = os.getenv("BASE_URL", "https://clone-popmart-production.up.railway.app/").rstrip("/")
+BASE_URL = os.getenv("BASE_URL", "https://popmartstt.com").rstrip("/")
 POP_PAGE_PATH = os.getenv("POP_PAGE_PATH", "/popmart").strip() or "/popmart"
 AJAX_PATH = os.getenv("AJAX_PATH", "/Ajax.aspx").strip() or "/Ajax.aspx"
 
@@ -49,6 +50,19 @@ ACTIVE_LOCK = threading.Lock()
 # Pending manual captcha (nếu không dùng 2Captcha)
 PENDING_CAPTCHAS: Dict[str, Dict[str, Any]] = {}
 PENDING_LOCK = threading.Lock()
+
+# ===== Env rows (optional) =====
+# Cấu hình dữ liệu đầu vào qua biến môi trường:
+# - POP_ROWS_JSON: JSON Array các object, ví dụ:
+#   [
+#     {"FullName":"A", "DOB_Day":"01","DOB_Month":"02","DOB_Year":"1999", "Phone":"090...", "Email":"a@x.com", "IDNumber":"00123"},
+#     {"FullName":"B", ...}
+#   ]
+# - hoặc POP_ROWS_BASE64: Base64 của JSON như trên (để dễ set trên hosting)
+# - hoặc POP_ROWS_CSV: nội dung CSV (header bắt buộc các cột như trên), mỗi dòng 1 record
+POP_ROWS_JSON = os.getenv("POP_ROWS_JSON", "").strip()
+POP_ROWS_BASE64 = os.getenv("POP_ROWS_BASE64", "").strip()
+POP_ROWS_CSV = os.getenv("POP_ROWS_CSV", "").strip()
 
 
 def _normalize_endpoints(base_url: str, pop_path: str, ajax_path: str):
@@ -197,7 +211,7 @@ def solve_captcha_via_2captcha(image_bytes: bytes) -> Optional[str]:
     if not TWO_CAPTCHA_API_KEY:
         return None
     try:
-        import time, base64
+        import time
         b64 = base64.b64encode(image_bytes).decode("ascii")
         r = requests.post("https://2captcha.com/in.php",
                           data={"key": TWO_CAPTCHA_API_KEY, "method": "base64", "body": b64, "json": 1},
@@ -254,37 +268,60 @@ def build_payload(id_ngay: str, id_phien: str, row: Dict[str, Any], captcha_text
     }
 
 
-async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    await update.message.reply_text(
-        "Gửi file Excel (.xlsx) cột: FullName, DOB_Day, DOB_Month, DOB_Year, Phone, Email, IDNumber.\n"
-        "Bot tự lấy mọi Sales Dates & chọn session đầu tiên. Mỗi ngày chạy 1 task và xử lý toàn bộ các dòng."
-    )
+# ======= Helpers: parse rows from ENV or Excel =======
+REQUIRED_COLS = ["FullName", "DOB_Day", "DOB_Month", "DOB_Year", "Phone", "Email", "IDNumber"]
 
 
-async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+def parse_rows_from_env() -> List[Dict[str, Any]]:
+    """Đọc dữ liệu đầu vào từ biến môi trường POP_ROWS_JSON / POP_ROWS_BASE64 / POP_ROWS_CSV."""
+    # Prefer BASE64 > JSON > CSV
+    if POP_ROWS_BASE64:
+        try:
+            raw = base64.b64decode(POP_ROWS_BASE64).decode("utf-8")
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return _normalize_rows_list(data)
+        except Exception as e:
+            log.error(f"POP_ROWS_BASE64 decode error: {e}")
 
-    doc = update.message.document
-    if not doc or not doc.file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("Vui lòng gửi file .xlsx")
-        return
+    if POP_ROWS_JSON:
+        try:
+            data = json.loads(POP_ROWS_JSON)
+            if isinstance(data, list):
+                return _normalize_rows_list(data)
+        except Exception as e:
+            log.error(f"POP_ROWS_JSON parse error: {e}")
 
-    file = await doc.get_file()
-    # FIX: đọc Excel với dtype=str để giữ nguyên số 0 đầu cho IDNumber, DOB_*, Phone...
-    df = pd.read_excel(io.BytesIO(await file.download_as_bytearray()), dtype=str)
-    required = ["FullName", "DOB_Day", "DOB_Month", "DOB_Year", "Phone", "Email", "IDNumber"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        await update.message.reply_text(
-            "❌ File thiếu cột bắt buộc: " + ", ".join(missing) +
-            "\nCần đủ: " + ", ".join(required)
-        )
-        return
+    if POP_ROWS_CSV:
+        try:
+            # Use pandas to parse CSV but force dtype=str to preserve leading zeros
+            csv_df = pd.read_csv(io.StringIO(POP_ROWS_CSV), dtype=str)
+            missing = [c for c in REQUIRED_COLS if c not in csv_df.columns]
+            if missing:
+                raise ValueError("CSV thiếu cột: " + ", ".join(missing))
+            return csv_df.to_dict(orient="records")
+        except Exception as e:
+            log.error(f"POP_ROWS_CSV parse error: {e}")
 
-    rows = df.to_dict(orient="records")
+    return []
+
+
+def _normalize_rows_list(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Đảm bảo các khóa tồn tại, và mọi giá trị là string (giữ nguyên số 0 đầu)."""
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        nr: Dict[str, Any] = {}
+        for k in REQUIRED_COLS:
+            v = r.get(k, "")
+            # chuyển mọi thứ về string để không mất 0 đầu
+            nr[k] = "" if v is None else str(v)
+        out.append(nr)
+    return out
+
+
+# ======= Core run logic (shared by Excel + ENV) =======
+async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: List[Dict[str, Any]]):
+    # Gắn chỉ số row
     for idx, r in enumerate(rows):
         r["__row_idx"] = idx
 
@@ -298,6 +335,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     unique_days = list(dict.fromkeys(all_days))
+
     # Anti-dup scheduling
     days_to_run = []
     with ACTIVE_LOCK:
@@ -509,16 +547,16 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Không có dữ liệu báo cáo (có thể tất cả bị chặn trước khi chạy).")
         return
 
-    df = pd.DataFrame(report_rows)
+    df_report = pd.DataFrame(report_rows)
     # sắp xếp gọn
-    sort_cols = [c for c in ["Day", "Row"] if c in df.columns]
+    sort_cols = [c for c in ["Day", "Row"] if c in df_report.columns]
     if sort_cols:
-        df = df.sort_values(sort_cols, kind="stable")
+        df_report = df_report.sort_values(sort_cols, kind="stable")
 
-    total = len(df)
-    succ = int((df["Status"] == "Success").sum())
-    fail = int((df["Status"] == "Failed").sum())
-    skip = int((df["Status"] == "Skipped").sum())
+    total = len(df_report)
+    succ = int((df_report["Status"] == "Success").sum())
+    fail = int((df_report["Status"] == "Failed").sum())
+    skip = int((df_report["Status"] == "Skipped").sum())
     summary = f"✅ Hoàn tất.\nTổng dòng: {total} — Thành công: {succ} • Thất bại: {fail} • Bỏ qua: {skip}"
 
     # tạo file Excel (fallback CSV nếu thiếu engine)
@@ -528,13 +566,13 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wrote = False
     try:
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Report")
+            df_report.to_excel(writer, index=False, sheet_name="Report")
         wrote = True
     except Exception:
         try:
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False, sheet_name="Report")
+                df_report.to_excel(writer, index=False, sheet_name="Report")
             wrote = True
         except Exception:
             wrote = False
@@ -544,12 +582,73 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(document=out, filename=xlsx_name, caption=summary)
     else:
         # fallback CSV
-        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        csv_bytes = df_report.to_csv(index=False).encode("utf-8-sig")
         await update.message.reply_document(
             document=io.BytesIO(csv_bytes),
             filename=f"popmart_report_{ts}.csv",
             caption=summary
         )
+
+
+# ===== Telegram Handlers =====
+async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    msg = (
+        "Gửi file Excel (.xlsx) cột: FullName, DOB_Day, DOB_Month, DOB_Year, Phone, Email, IDNumber.\n"
+        "Hoặc đã cấu hình biến môi trường POP_ROWS_JSON/POP_ROWS_BASE64/POP_ROWS_CSV thì dùng lệnh /batdau để chạy ngay.\n"
+        "Bot tự lấy mọi Sales Dates & chọn session đầu tiên. Mỗi ngày chạy 1 task và xử lý toàn bộ các dòng."
+    )
+    await update.message.reply_text(msg)
+
+
+async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    doc = update.message.document
+    if not doc or not doc.file_name.lower().endswith(".xlsx"):
+        await update.message.reply_text("Vui lòng gửi file .xlsx")
+        return
+
+    file = await doc.get_file()
+    # đọc Excel với dtype=str để giữ nguyên số 0 đầu
+    df = pd.read_excel(io.BytesIO(await file.download_as_bytearray()), dtype=str)
+
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        await update.message.reply_text(
+            "❌ File thiếu cột bắt buộc: " + ", ".join(missing) +
+            "\nCần đủ: " + ", ".join(REQUIRED_COLS)
+        )
+        return
+
+    rows = df.to_dict(orient="records")
+    await run_with_rows(update, context, rows)
+
+
+async def cmd_batdau(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Chạy dữ liệu đã được cài sẵn qua biến môi trường."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    rows = parse_rows_from_env()
+    if not rows:
+        await update.message.reply_text(
+            "❌ Không tìm thấy dữ liệu trong biến môi trường.\n"
+            "Hãy set một trong các biến: POP_ROWS_BASE64 (base64 JSON), POP_ROWS_JSON (JSON) hoặc POP_ROWS_CSV (CSV)."
+        )
+        return
+
+    # Validate đủ cột
+    miss_any = any(any((r.get(c, "") == "" for c in REQUIRED_COLS)) for r in rows)
+    if miss_any:
+        await update.message.reply_text(
+            "⚠️ Dữ liệu biến môi trường thiếu trường bắt buộc ở một số dòng. "
+            "Cần đủ các cột: " + ", ".join(REQUIRED_COLS)
+        )
+        # vẫn tiếp tục chạy với các dòng đã có? Ở đây chọn chạy tất cả, vì build_payload đã str() mọi thứ
+    await run_with_rows(update, context, rows)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -723,6 +822,7 @@ def main():
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("batdau", cmd_batdau))  # <-- new command
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
