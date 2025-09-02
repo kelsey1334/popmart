@@ -1,3 +1,4 @@
+
 import os
 import io
 import json
@@ -243,9 +244,9 @@ def build_payload(id_ngay: str, id_phien: str, row: Dict[str, Any], captcha_text
         "idNgayBanHang": id_ngay,
         "idPhien": id_phien,
         "HoTen": str(row["FullName"]).strip(),
-        "NgaySinh_Ngay": str(int(row["DOB_Day"])),
-        "NgaySinh_Thang": str(int(row["DOB_Month"])),
-        "NgaySinh_Nam": str(int(row["DOB_Year"])),
+        "NgaySinh_Ngay": str(row["DOB_Day"]).strip(),
+        "NgaySinh_Thang": str(row["DOB_Month"]).strip(),
+        "NgaySinh_Nam": str(row["DOB_Year"]).strip(),
         "SoDienThoai": str(row["Phone"]).strip(),
         "Email": str(row["Email"]).strip(),
         "CCCD": str(row["IDNumber"]).strip(),
@@ -272,7 +273,8 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file = await doc.get_file()
-    df = pd.read_excel(io.BytesIO(await file.download_as_bytearray()))
+    # FIX: đọc Excel với dtype=str để giữ nguyên số 0 đầu cho IDNumber, DOB_*, Phone...
+    df = pd.read_excel(io.BytesIO(await file.download_as_bytearray()), dtype=str)
     required = ["FullName", "DOB_Day", "DOB_Month", "DOB_Year", "Phone", "Email", "IDNumber"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -501,7 +503,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks = [context.application.create_task(process_day(d, buckets[d])) for d in days_to_run]
     await update.message.reply_text("Đã khởi chạy các task theo ngày. Bot sẽ báo kết quả khi có.")
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    _ = await asyncio.gather(*tasks, return_exceptions=True)
     # Tổng hợp & xuất báo cáo
     if not report_rows:
         await update.message.reply_text("Không có dữ liệu báo cáo (có thể tất cả bị chặn trước khi chạy).")
